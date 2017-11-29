@@ -1,0 +1,85 @@
+from datetime import datetime
+import logging
+import gevent
+import hpfeeds
+import MySQLdb
+
+from Handlers.BaseHandler import BaseHandler
+
+logger = logging.getLogger('artemis')
+
+
+class FeedPuller(object):
+    def __init__(self, config):
+
+        self.config = config
+        self.mysqlserver = config['mysqlserver']
+        self.mysqluser = config['mysqluser']
+        self.mysqlpwd = config['mysqlpass']
+        self.mysqldb = config['mysqldb']
+        self.ident = config['hpf_ident']
+        self.secret = config['hpf_secret']
+        self.port = config['hpf_port']
+        self.host = config['hpf_host']
+        self.feeds = config['hpf_channels']
+        self.last_received = datetime.now()
+
+        self.hpc = None
+        self.enabled = True
+        self.db_cursor = None
+
+    def db_connect(self):
+        logger.debug("Connecting to MySQL database")
+        db_conn = MySQLdb.connect(host=self.mysqlserver,
+                                 user=self.mysqluser,
+                                 passwd=self.mysqlpwd,
+                                 db=self.mysqldb)
+
+        db_conn.autocommit(True)
+        return db_conn
+
+    def start_listening(self):
+
+        gevent.spawn_later(15, self._activity_checker)
+        while self.enabled:
+            try:
+                self.hpc = hpfeeds.new(self.host, self.port, self.ident, self.secret)
+
+                def on_error(payload):
+                    logger.error('Error message from broker: {0}'.format(payload))
+                    self.hpc.stop()
+
+                def on_message(ident, chan, payload):
+                    self.last_received = datetime.now()
+                    db_conn = self.db_connect()
+                    db_cursor = db_conn.cursor()
+
+                    handler = BaseHandler(ident,db_cursor,self.config)
+                    handler.select_module(chan)
+                    handler.handle_payload(payload)
+
+                    db_conn.close()
+                    
+
+                self.hpc.subscribe(self.feeds)
+                self.hpc.run(on_message, on_error)
+            except Exception as ex:
+                print ex
+                self.hpc.stop()
+                logger.exception('Exception caught: {0}'.format(ex))
+            #throttle
+            gevent.sleep(5)
+
+    def stop(self):
+        self.hpc.stop()
+        self.enabled = False
+        logger.info("FeedPuller stopped.")
+
+    def _activity_checker(self):
+        while self.enabled:
+            if self.hpc is not None and self.hpc.connected:
+                difference = datetime.now() - self.last_received
+                if difference.seconds > 15:
+                    logger.warning('No activity for 15 seconds, forcing reconnect')
+                    self.hpc.stop()
+            gevent.sleep(15)
